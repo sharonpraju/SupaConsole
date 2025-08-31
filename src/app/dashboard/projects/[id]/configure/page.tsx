@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { PasswordInput } from '@/components/ui/password-input'
 
 interface ConfigureProjectPageProps {
   params: Promise<{
@@ -265,6 +266,15 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
     }
   }
 
+  const [passwordVisibility, setPasswordVisibility] = useState<{[key: string]: boolean}>({})
+
+  const togglePasswordVisibility = (fieldName: string) => {
+    setPasswordVisibility(prev => ({
+      ...prev,
+      [fieldName]: !prev[fieldName]
+    }))
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b">
@@ -332,18 +342,16 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="postgres_password">PostgreSQL Password</Label>
-                    <Input
+                    <PasswordInput
                       id="postgres_password"
-                      type="password"
                       value={envVars.POSTGRES_PASSWORD}
                       onChange={createInputHandler('POSTGRES_PASSWORD')}
                     />
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="jwt_secret">JWT Secret</Label>
-                    <Input
+                    <PasswordInput
                       id="jwt_secret"
-                      type="password"
                       value={envVars.JWT_SECRET}
                       onChange={createInputHandler('JWT_SECRET')}
                     />
@@ -359,27 +367,24 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="dashboard_password">Dashboard Password</Label>
-                    <Input
+                    <PasswordInput
                       id="dashboard_password"
-                      type="password"
                       value={envVars.DASHBOARD_PASSWORD}
                       onChange={createInputHandler('DASHBOARD_PASSWORD')}
                     />
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="secret_key_base">Secret Key Base</Label>
-                    <Input
+                    <PasswordInput
                       id="secret_key_base"
-                      type="password"
                       value={envVars.SECRET_KEY_BASE}
                       onChange={createInputHandler('SECRET_KEY_BASE')}
                     />
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="vault_enc_key">Vault Encryption Key</Label>
-                    <Input
+                    <PasswordInput
                       id="vault_enc_key"
-                      type="password"
                       value={envVars.VAULT_ENC_KEY}
                       onChange={createInputHandler('VAULT_ENC_KEY')}
                     />
@@ -409,9 +414,8 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="service_role_key">Service Role Key (Secret)</Label>
-                    <Input
+                    <PasswordInput
                       id="service_role_key"
-                      type="password"
                       value={envVars.SERVICE_ROLE_KEY}
                       onChange={createInputHandler('SERVICE_ROLE_KEY')}
                     />
@@ -559,9 +563,8 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="smtp_pass">SMTP Password</Label>
-                    <Input
+                    <PasswordInput
                       id="smtp_pass"
-                      type="password"
                       value={envVars.SMTP_PASS}
                       onChange={createInputHandler('SMTP_PASS')}
                     />
@@ -641,9 +644,8 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="openai_api_key">OpenAI API Key (Optional)</Label>
-                    <Input
+                    <PasswordInput
                       id="openai_api_key"
-                      type="password"
                       placeholder="For SQL Editor Assistant"
                       value={envVars.OPENAI_API_KEY}
                       onChange={createInputHandler('OPENAI_API_KEY')}
