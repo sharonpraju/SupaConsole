@@ -1,0 +1,62 @@
+version: "3.9"
+
+x-common-env: &common-env
+  NODE_ENV: production
+  PORT: "3000"
+
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.1
+    profiles: ["proxy"]
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      SERVICES: 1
+      SYSTEM: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks: [internal]
+
+  supaconsole:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: supaconsole:local
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+      # If using the socket-proxy profile, DOCKER_HOST should be set in .env
+    volumes:
+      - supaconsole-data:/app/data
+      - supabase-core:/app/supabase-core
+      - supabase-projects:/app/supabase-projects
+      # If NOT using proxy and you want direct socket, enable the next line and run with profile "direct":
+      # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    networks: [internal, web]
+    # EITHER expose port 3000 directly...
+    # ports:
+    #   - "3000:3000"
+    # ...OR, if you run Traefik, use labels:
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supaconsole.rule=Host(`${TRAEFIK_HOST}`)
+      - traefik.http.routers.supaconsole.entrypoints=websecure
+      - traefik.http.routers.supaconsole.tls.certresolver=${TRAEFIK_RESOLVER}
+      - traefik.http.services.supaconsole.loadbalancer.server.port=3000
+
+networks:
+  internal:
+  web:
+    external: true
+    name: ${TRAEFIK_NETWORK}
+
+volumes:
+  supaconsole-data:
+  supabase-core:
+  supabase-projects:

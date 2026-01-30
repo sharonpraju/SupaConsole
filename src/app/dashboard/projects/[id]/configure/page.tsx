@@ -10,9 +10,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
 interface ConfigureProjectPageProps {
-  params: Promise<{
+  params: {
     id: string
-  }>
+  }
 }
 
 export default function ConfigureProjectPage({ params }: ConfigureProjectPageProps) {
@@ -116,7 +116,9 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
   const router = useRouter()
   
   useEffect(() => {
-    params.then(({ id }) => setProjectId(id))
+    if (params?.id) {
+      setProjectId(params.id)
+    }
   }, [params])
 
   // Load existing environment variables when projectId is available
@@ -325,7 +327,7 @@ export default function ConfigureProjectPage({ params }: ConfigureProjectPagePro
                   variant="outline"
                   type="button"
                 >
-                  Generate New Secure Secrets
+                  Generate New Secure Credentials
                 </Button>
               </CardHeader>
               <CardContent>

@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.1
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      SERVICES: 1
+      SYSTEM: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  supaconsole:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: supaconsole:local
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    volumes:
+      - supaconsole-data:/app/data
+      - supabase-core:/app/supabase-core
+      - supabase-projects:/app/supabase-projects
+    depends_on:
+      - docker-proxy
+    restart: unless-stopped
+    # No ports, no labels — Dokploy will wire routing after you add a Domain.
+
+volumes:
+  supaconsole-data:
+  supabase-core:
+  supabase-projects:

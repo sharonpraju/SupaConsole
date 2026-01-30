@@ -224,15 +224,27 @@ npm run start
 
 ### Docker Deployment
 
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY . .
-RUN npm ci --only=production
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "start"]
+Use the included Dockerfile for production. Ensure persistence and Docker socket access:
+
+```bash
+# Build image
+docker build -t supaconsole .
+
+# Run with persistent SQLite and Docker socket (for Supabase project management)
+docker run -d \
+  -p 3000:3000 \
+  -e DATABASE_URL="file:/app/data/db.sqlite" \
+  -e NEXTAUTH_SECRET="$(openssl rand -base64 32)" \
+  -v "$PWD/data:/app/data" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --name supaconsole \
+  supaconsole
 ```
+
+Optional additional volumes:
+
+- `/app/supabase-core` – cached Supabase repo clone
+- `/app/supabase-projects` – per-project Docker files
 
 ## 🤝 Contributing
 

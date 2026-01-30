@@ -1,0 +1,13 @@
+.git
+node_modules
+.next
+Dockerfile
+*.log
+.prisma
+prisma/dev.db
+supabase-core
+supabase-projects
+.env
+.env.*
+dist
+coverage

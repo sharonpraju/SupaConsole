@@ -1,0 +1,20 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "openssl"]
+
+[phases.install]
+cmds = [
+  "npm ci --legacy-peer-deps",
+  "npx prisma generate"
+]
+
+[phases.build]
+cmds = [
+  "npm run build"
+]
+
+[start]
+cmd = "npx prisma db push --accept-data-loss && npm run start"
+
+[variables]
+NODE_ENV = "production"
+PORT = "3000"
