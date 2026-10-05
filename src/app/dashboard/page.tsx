@@ -105,12 +105,16 @@ export default function DashboardPage() {
         
         // Extract URLs from environment variables
         const urls: Record<string, string> = {}
-        if (envVars.KONG_HTTP_PORT) {
-          urls['API Gateway'] = `http://localhost:${envVars.KONG_HTTP_PORT}`
+        // Current Supabase exposes the gateway (Envoy) on API_GW_HTTP_PORT and
+        // only falls back to the retired KONG_HTTP_PORT on older releases.
+        const gatewayPort = envVars.API_GW_HTTP_PORT || envVars.KONG_HTTP_PORT
+        if (gatewayPort) {
+          urls['API Gateway'] = `http://localhost:${gatewayPort}`
+          // Studio is served by the gateway itself, so it shares that port.
+          urls['Supabase Studio'] = `http://localhost:${gatewayPort}`
         }
-        if (envVars.STUDIO_PORT) {
-          urls['Supabase Studio'] = `http://localhost:${envVars.KONG_HTTP_PORT || 8000}`
-        }
+        // Analytics/Logflare is no longer part of the default compose file; only
+        // surface the link on releases that still publish a port for it.
         if (envVars.ANALYTICS_PORT) {
           urls['Analytics (Logflare)'] = `http://localhost:${envVars.ANALYTICS_PORT}`
         }

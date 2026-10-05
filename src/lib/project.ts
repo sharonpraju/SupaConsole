@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
+import * as crypto from 'crypto'
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import { prisma } from './db'
@@ -16,17 +17,68 @@ function generateRandomString(length: number): string {
   return result
 }
 
-function generateJWT(role: 'anon' | 'service_role', timestamp: number): string {
-  // Generate a simple JWT-like token (for demo purposes)
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
-  const payload = Buffer.from(JSON.stringify({
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64url')
+}
+
+// Signs a real HS256 JWT with the project's JWT_SECRET.
+// Supabase validates the anon/service_role keys as HS256 JWTs against
+// JWT_SECRET (PostgREST, GoTrue and Realtime all reject a bad signature),
+// so these MUST be genuinely signed rather than carrying a placeholder.
+function generateJWT(role: 'anon' | 'service_role', secret: string, timestamp: number): string {
+  const issuedAt = Math.floor(timestamp / 1000)
+  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
+  const payload = base64url(JSON.stringify({
     role,
     iss: 'supabase',
-    iat: Math.floor(timestamp / 1000),
-    exp: Math.floor(timestamp / 1000) + (365 * 24 * 60 * 60) // 1 year
-  })).toString('base64url')
-  const signature = generateRandomString(43) // Mock signature
+    iat: issuedAt,
+    exp: issuedAt + (365 * 24 * 60 * 60),
+  }))
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(`${header}.${payload}`)
+    .digest('base64url')
   return `${header}.${payload}.${signature}`
+}
+
+// Reads KEY=value pairs out of the upstream .env.example that ships inside
+// supabase-core/docker. Using this as the source of truth means new Supabase
+// releases are picked up automatically instead of requiring code changes.
+function parseEnvExample(content: string): Map<string, string> {
+  const vars = new Map<string, string>()
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim().replace(/^#\s?/, '')
+    if (!line || line.startsWith('#')) continue
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key)) continue
+    let value = line.slice(eq + 1).trim()
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length > 1)
+    ) {
+      value = value.slice(1, -1)
+    }
+    vars.set(key, value)
+  }
+  return vars
+}
+
+// Extracts every container_name declared in the compose file so the
+// per-project renaming stays correct as services are added or removed
+// upstream (e.g. supabase-kong -> supabase-envoy).
+function extractContainerNames(composeContent: string): string[] {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const match of composeContent.matchAll(/^\s*container_name:\s*(\S+)\s*$/gm)) {
+    const name = match[1].replace(/^["']|["']$/g, '')
+    if (name && !seen.has(name)) {
+      seen.add(name)
+      names.push(name)
+    }
+  }
+  return names
 }
 
 // Pre-flight checks for Docker deployment
@@ -110,30 +162,68 @@ async function checkInternetConnectivity(): Promise<boolean> {
   return false
 }
 
+// Accepts either a plain repository URL or a full `git clone ...` command as
+// documented in the README, and returns just the repository URL.
+function normalizeRepoUrl(raw: string): string {
+  const value = raw.trim().replace(/^["']|["']$/g, '')
+  const cloneMatch = value.match(/^git\s+clone\b.*?(\S+)$/i)
+  const url = (cloneMatch ? cloneMatch[1] : value).trim()
+  if (!/^(https?:\/\/|git@|ssh:\/\/)/.test(url)) {
+    throw new Error(`SUPABASE_CORE_REPO_URL must be an http(s) or ssh repository URL, received: ${url}`)
+  }
+  return url
+}
+
+// A clone is only usable if the docker directory we actually copy projects from
+// is present, so an interrupted clone is detected and retried rather than being
+// mistaken for a finished workspace.
+async function isUsableSupabaseCore(coreDir: string): Promise<boolean> {
+  const dockerCompose = path.join(coreDir, 'docker', 'docker-compose.yml')
+  return fs.access(dockerCompose).then(() => true).catch(() => false)
+}
+
 export async function initializeSupabaseCore() {
   const coreDir = path.join(process.cwd(), 'supabase-core')
   const projectsDir = path.join(process.cwd(), 'supabase-projects')
+  const stagingDir = path.join(process.cwd(), '.supabase-core-incoming')
   
   try {
-    // Check if directories already exist
-    const coreExists = await fs.access(coreDir).then(() => true).catch(() => false)
     const projectsExists = await fs.access(projectsDir).then(() => true).catch(() => false)
     
-    // Create supabase-projects directory if it doesn't exist
     if (!projectsExists) {
       await fs.mkdir(projectsDir, { recursive: true })
     }
     
-    // Clone repository if supabase-core doesn't exist
-    if (!coreExists) {
-      const repoUrl = process.env.SUPABASE_CORE_REPO_URL || 'https://github.com/supabase/supabase'
-      
-      // Use shallow clone for faster download
-      await execAsync(`git clone --depth 1 ${repoUrl} supabase-core`)
+    if (await isUsableSupabaseCore(coreDir)) {
+      return { success: true }
     }
+
+    // An earlier attempt may have been interrupted part-way through, leaving a
+    // directory that exists but has no usable checkout.
+    if (await fs.access(coreDir).then(() => true).catch(() => false)) {
+      console.warn('Existing supabase-core directory is incomplete, re-cloning')
+      await fs.rm(coreDir, { recursive: true, force: true })
+    }
+    
+    const repoUrl = normalizeRepoUrl(
+      process.env.SUPABASE_CORE_REPO_URL || 'https://github.com/supabase/supabase'
+    )
+
+    // Clone to a staging directory and move it into place only once complete, so
+    // an interrupted clone can never leave a half-populated supabase-core.
+    await fs.rm(stagingDir, { recursive: true, force: true })
+    console.log(`Cloning Supabase core from ${repoUrl}...`)
+    await execAsync(`git clone --depth 1 ${repoUrl} .supabase-core-incoming`, { timeout: 1800000 })
+    
+    if (!(await isUsableSupabaseCore(stagingDir))) {
+      throw new Error('Clone finished but docker/docker-compose.yml is missing from the Supabase repository')
+    }
+    
+    await fs.rename(stagingDir, coreDir)
     
     return { success: true }
   } catch (error) {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined)
     console.error('Failed to initialize Supabase core:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
@@ -174,34 +264,28 @@ export async function createProject(name: string, userId: string, description?: 
     const dockerComposeFile = path.join(projectDir, 'docker', 'docker-compose.yml')
     let dockerComposeContent = await fs.readFile(dockerComposeFile, 'utf8')
     
-    // Replace container names with project-specific names
-    const containerMappings = [
-      { original: 'supabase-studio', replacement: `${slug}-studio` },
-      { original: 'supabase-kong', replacement: `${slug}-kong` },
-      { original: 'supabase-auth', replacement: `${slug}-auth` },
-      { original: 'supabase-rest', replacement: `${slug}-rest` },
-      { original: 'realtime-dev.supabase-realtime', replacement: `realtime-dev.${slug}-realtime` },
-      { original: 'supabase-storage', replacement: `${slug}-storage` },
-      { original: 'supabase-imgproxy', replacement: `${slug}-imgproxy` },
-      { original: 'supabase-meta', replacement: `${slug}-meta` },
-      { original: 'supabase-edge-functions', replacement: `${slug}-edge-functions` },
-      { original: 'supabase-analytics', replacement: `${slug}-analytics` },
-      { original: 'supabase-db', replacement: `${slug}-db` },
-      { original: 'supabase-vector', replacement: `${slug}-vector` },
-      { original: 'supabase-pooler', replacement: `${slug}-pooler` }
-    ]
-    
-    // Replace container names in the compose file
-    for (const mapping of containerMappings) {
+    // Replace container names with project-specific names. Names are read from
+    // the compose file itself so new/renamed upstream services (for example
+    // supabase-kong becoming supabase-envoy) are handled without code changes.
+    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+    for (const containerName of extractContainerNames(dockerComposeContent)) {
+      const suffix = containerName
+        .replace(/^supabase-/, '')
+        .replace(/^realtime-dev\./, '')
+      const replacement = containerName.startsWith('realtime-dev.')
+        ? `realtime-dev.${slug}-${suffix}`
+        : `${slug}-${suffix}`
+
       dockerComposeContent = dockerComposeContent.replace(
-        new RegExp(`container_name: ${mapping.original}`, 'g'),
-        `container_name: ${mapping.replacement}`
+        new RegExp(`(container_name:\\s*)${escapeRegExp(containerName)}\\b`, 'g'),
+        `$1${replacement}`
       )
     }
-    
+
     // Update the compose project name to be unique
     dockerComposeContent = dockerComposeContent.replace(
-      /^name: supabase$/m,
+      /^name:\s*\S+\s*$/m,
       `name: ${slug}`
     )
     
@@ -209,68 +293,103 @@ export async function createProject(name: string, userId: string, description?: 
     // Write the modified docker-compose.yml back
     await fs.writeFile(dockerComposeFile, dockerComposeContent)
     
-    // Generate unique default port values to prevent conflicts
-    const basePort = 8000 + (timestamp % 10000) // Use last 4 digits of timestamp for uniqueness
-    const defaultEnvVars = {
-      // Secrets - generated random values
+    // Generate unique default port values to prevent conflicts between projects.
+    // Each key is offset from a per-project base so concurrent projects never collide.
+    const basePort = 8000 + (timestamp % 10000)
+    const portOffsets: Record<string, number> = {
+      API_GW_HTTP_PORT: 0,
+      KONG_HTTP_PORT: 0,
+      KONG_HTTPS_PORT: 443,
+      STUDIO_PORT: 100,
+      ANALYTICS_PORT: 1000,
+      POSTGRES_PORT: 2000,
+      POOLER_PROXY_PORT_TRANSACTION: 3000,
+    }
+
+    // Build the environment from the .env.example that ships with the cloned
+    // Supabase release, so every variable the current compose file expects is
+    // present with a sane value, then override the ones SupaConsole owns.
+    const envExampleFile = path.join(coreDockerDir, '.env.example')
+    const upstreamEnv = parseEnvExample(await fs.readFile(envExampleFile, 'utf8'))
+
+    const jwtSecret = generateRandomString(64)
+    const publicUrl = `http://localhost:${basePort}`
+    const tenantId = `project-${timestamp}`
+
+    // Values SupaConsole must own: credentials, signing material, and identity.
+    const overrides: Record<string, string> = {
       POSTGRES_PASSWORD: generateRandomString(32),
-      JWT_SECRET: generateRandomString(64),
-      ANON_KEY: generateJWT('anon', timestamp),
-      SERVICE_ROLE_KEY: generateJWT('service_role', timestamp),
-      DASHBOARD_USERNAME: 'supabase',
-      DASHBOARD_PASSWORD: generateRandomString(16),
+      JWT_SECRET: jwtSecret,
+      ANON_KEY: generateJWT('anon', jwtSecret, timestamp),
+      SERVICE_ROLE_KEY: generateJWT('service_role', jwtSecret, timestamp),
       SECRET_KEY_BASE: generateRandomString(64),
       VAULT_ENC_KEY: generateRandomString(32),
-      
-      // Unique ports to prevent conflicts between projects
-      POSTGRES_PORT: (basePort + 2000).toString(),
-      POOLER_PROXY_PORT_TRANSACTION: (basePort + 3000).toString(),
-      KONG_HTTP_PORT: basePort.toString(),
-      KONG_HTTPS_PORT: (basePort + 443).toString(),
-      ANALYTICS_PORT: (basePort + 1000).toString(),
-      
-      // Database
+      // Realtime encrypts with AES-128, so this must be exactly 16 characters.
+      REALTIME_DB_ENC_KEY: generateRandomString(16),
+      // pgcrypto requires this to be at least 32 characters.
+      PG_META_CRYPTO_KEY: generateRandomString(32),
+      DASHBOARD_USERNAME: 'supabase',
+      DASHBOARD_PASSWORD: generateRandomString(16),
+      MINIO_ROOT_USER: 'supabase',
+      MINIO_ROOT_PASSWORD: generateRandomString(32),
+      S3_PROTOCOL_ACCESS_KEY_ID: generateRandomString(24),
+      S3_PROTOCOL_ACCESS_KEY_SECRET: generateRandomString(64),
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: generateRandomString(64),
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: generateRandomString(64),
+
+      // Identity / tenancy
       POSTGRES_HOST: 'db',
       POSTGRES_DB: 'postgres',
-      
-      // Other defaults
-      POOLER_DEFAULT_POOL_SIZE: '20',
-      POOLER_MAX_CLIENT_CONN: '100',
-      POOLER_TENANT_ID: `project-${timestamp}`,
-      POOLER_DB_POOL_SIZE: '5',
-      PGRST_DB_SCHEMAS: 'public,storage,graphql_public',
-      SITE_URL: `http://localhost:${basePort}`,
-      ADDITIONAL_REDIRECT_URLS: '',
-      JWT_EXPIRY: '3600',
-      DISABLE_SIGNUP: 'false',
-      API_EXTERNAL_URL: `http://localhost:${basePort}`,
-      MAILER_URLPATHS_CONFIRMATION: '/auth/v1/verify',
-      MAILER_URLPATHS_INVITE: '/auth/v1/verify',
-      MAILER_URLPATHS_RECOVERY: '/auth/v1/verify',
-      MAILER_URLPATHS_EMAIL_CHANGE: '/auth/v1/verify',
-      ENABLE_EMAIL_SIGNUP: 'true',
-      ENABLE_EMAIL_AUTOCONFIRM: 'false',
+      POOLER_TENANT_ID: tenantId,
+      STORAGE_TENANT_ID: tenantId,
+      REGION: 'local',
+      GLOBAL_S3_BUCKET: 'stub',
+
+      // Public URLs must follow this project's allocated gateway port.
+      SUPABASE_PUBLIC_URL: publicUrl,
+      API_EXTERNAL_URL: publicUrl,
+      SITE_URL: publicUrl,
+      PROXY_DOMAIN: publicUrl,
+      SAML_EXTERNAL_URL: `${publicUrl}/auth/v1`,
+
+      // Upstream ships SAML_ENABLED=true alongside a placeholder private key.
+      // Enabling it with a non-key makes GoTrue fail to parse it, so keep SAML
+      // off until a real key is supplied.
+      SAML_ENABLED: 'false',
+      SAML_PRIVATE_KEY: '',
+      SAML_ALLOW_ENCRYPTED_ASSERTIONS: 'false',
+
+      // Keep phone sign-up usable with the local mail catcher.
       SMTP_ADMIN_EMAIL: 'admin@example.com',
       SMTP_HOST: 'supabase-mail',
       SMTP_PORT: '2500',
       SMTP_USER: 'fake_mail_user',
       SMTP_PASS: 'fake_mail_password',
       SMTP_SENDER_NAME: 'fake_sender',
-      ENABLE_ANONYMOUS_USERS: 'false',
-      ENABLE_PHONE_SIGNUP: 'true',
-      ENABLE_PHONE_AUTOCONFIRM: 'true',
-      STUDIO_DEFAULT_ORGANIZATION: 'Default Organization',
-      STUDIO_DEFAULT_PROJECT: 'Default Project',
-      STUDIO_PORT: (basePort + 100).toString(),
-      SUPABASE_PUBLIC_URL: `http://localhost:${basePort}`,
-      IMGPROXY_ENABLE_WEBP_DETECTION: 'true',
+      SMS_PROVIDER: 'twilio',
+      SMS_TEST_OTP: '123456',
+
       OPENAI_API_KEY: '',
-      FUNCTIONS_VERIFY_JWT: 'false',
-      LOGFLARE_PUBLIC_ACCESS_TOKEN: generateRandomString(64),
-      LOGFLARE_PRIVATE_ACCESS_TOKEN: generateRandomString(64),
-      DOCKER_SOCKET_LOCATION: '/var/run/docker.sock',
-      GOOGLE_PROJECT_ID: 'GOOGLE_PROJECT_ID',
-      GOOGLE_PROJECT_NUMBER: 'GOOGLE_PROJECT_NUMBER'
+      ADDITIONAL_REDIRECT_URLS: '',
+    }
+
+    // Upstream defaults, with SupaConsole's overrides applied on top. Port keys
+    // are only written when the current release actually defines them, which
+    // avoids resurrecting variables upstream has retired.
+    const defaultEnvVars: Record<string, string> = {}
+    for (const [key, upstreamValue] of upstreamEnv) {
+      if (key in portOffsets) {
+        defaultEnvVars[key] = (basePort + portOffsets[key]).toString()
+      } else if (key in overrides) {
+        defaultEnvVars[key] = overrides[key]
+      } else {
+        defaultEnvVars[key] = upstreamValue
+      }
+    }
+    // Overrides for keys this Supabase release does not define are still written
+    // so older or newer compose files keep working.
+    for (const [key, value] of Object.entries(overrides)) {
+      if (!(key in defaultEnvVars)) defaultEnvVars[key] = value
     }
     
     // Write initial .env file with unique defaults
@@ -327,11 +446,22 @@ export async function updateProjectEnvVars(projectId: string, envVars: Record<st
       })
     }
     
-    // Update .env file in project directory
+    // Update .env file in project directory. Compose needs every variable the
+    // release defines, so merge over what is already stored instead of writing
+    // only the submitted subset.
     const projectDir = path.join(process.cwd(), 'supabase-projects', project.slug, 'docker')
     const envFilePath = path.join(projectDir, '.env')
-    
-    const envContent = Object.entries(envVars)
+
+    const stored = await prisma.projectEnvVar.findMany({ where: { projectId } })
+    const merged: Record<string, string> = {}
+    for (const row of stored) {
+      merged[row.key] = row.value
+    }
+    for (const [key, value] of Object.entries(envVars)) {
+      merged[key] = value
+    }
+
+    const envContent = Object.entries(merged)
       .map(([key, value]) => `${key}=${value}`)
       .join('\n')
     
